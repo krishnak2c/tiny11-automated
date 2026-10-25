@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Headless script to build a minimized Windows 11 Nano image for CI/CD automation.
 
@@ -89,6 +89,60 @@ function Write-Log {
     $logMessage = "[$timestamp] [$Level] $Message"
     Write-Output $logMessage
     Add-Content -Path $logFile -Value $logMessage -ErrorAction SilentlyContinue
+}
+
+function Write-IsoAnswerFile {
+    # Copies the unattend template to $Destination, rewriting the /IMAGE/INDEX
+    # placeholder so the edition chosen with -INDEX is the one that actually gets
+    # installed. The static template hard-codes index 1, so without this rewrite a
+    # Pro/Education build would silently install Home.
+    #
+    # The content is parsed as XML before it is written: Windows Setup hard-fails on
+    # a malformed answer file, and a rejected answer file is exactly how the OOBE /
+    # local-account automation silently stops working.
+    param(
+        [Parameter(Mandatory=$true)][string]$Destination,
+        [Parameter(Mandatory=$false)][string]$Template
+    )
+
+    if (-not $Template) {
+        $Template = @(
+            (Join-Path (Split-Path $PSScriptRoot -Parent) "autounattend-nano.xml"),
+            (Join-Path $PSScriptRoot "autounattend-nano.xml"),
+            (Join-Path (Split-Path $PSScriptRoot -Parent) "autounattend.xml")
+        ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+    }
+
+    if (-not $Template -or -not (Test-Path $Template)) {
+        Write-Log "No unattend template found - OOBE will not be automated" "WARN"
+        return
+    }
+
+    try {
+        $content = Get-Content -LiteralPath $Template -Raw
+        $content = [regex]::Replace(
+            $content,
+            '(<Key>/IMAGE/INDEX</Key>\s*<Value>)\d+(</Value>)',
+            ('${1}' + $INDEX + '${2}')
+        )
+
+        # Throws if the template is not well-formed XML - we want that to be loud.
+        $null = [xml]$content
+
+        $destDir = Split-Path -Parent $Destination
+        if (-not (Test-Path $destDir)) {
+            New-Item -ItemType Directory -Force -Path $destDir | Out-Null
+        }
+
+        # UTF-8 without BOM - Setup is happier without a BOM on the answer file.
+        $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+        [System.IO.File]::WriteAllText($Destination, $content, $utf8NoBom)
+
+        Write-Log "Wrote unattended answer file to $Destination (IMAGE/INDEX = $INDEX)"
+    } catch {
+        Write-Log "Failed to write answer file to ${Destination}: $_" "ERROR"
+        throw
+    }
 }
 
 function Set-RegistryValue {
@@ -772,14 +826,17 @@ function Patch-ReAgentXml {
 </WindowsRE>
 '@
 
-    try {
-        # Ensure the Recovery directory exists (it should, but be defensive)
-        $recoveryDir = "$scratchDir\Windows\System32\Recovery"
-        if (-not (Test-Path $recoveryDir)) {
-            New-Item -ItemType Directory -Force -Path $recoveryDir | Out-Null
-            Write-Log "Created missing Recovery directory."
-        }
+    # Only ever patch a ReAgent.xml that is already there. Creating the file (and
+    # its parent directory) inside boot.wim adds entries the stock image does not
+    # have, which is a gratuitous deviation from Microsoft's boot media - and the
+    # boot media is precisely what third-party boot managers such as Ventoy
+    # inspect and patch.
+    if (-not (Test-Path -LiteralPath $reagentXmlPath)) {
+        Write-Log "No ReAgent.xml at $reagentXmlPath - nothing to patch"
+        return
+    }
 
+    try {
         # Write as UTF-8 without BOM — reagentc expects plain UTF-8
         $utf8NoBom = New-Object System.Text.UTF8Encoding $false
         [System.IO.File]::WriteAllText($reagentXmlPath, $cleanXml.TrimStart(), $utf8NoBom)
@@ -960,15 +1017,17 @@ function Apply-RegistryTweaks {
     Set-RegistryValue 'HKLM\zSOFTWARE\Policies\Microsoft\Windows\CloudContent' 'DisableConsumerAccountStateContent' 'REG_DWORD' '1'
     Set-RegistryValue 'HKLM\zSOFTWARE\Policies\Microsoft\Windows\CloudContent' 'DisableCloudOptimizedContent' 'REG_DWORD' '1'
 
-    # Enable local accounts on OOBE
+    # Out-of-the-box offline local account.
+    # BypassNRO re-enables the "I don't have internet" path Microsoft removed from
+    # the OOBE UI in 24H2+, and DisableOnline stops OOBE demanding a network
+    # connection before it will continue. These are belt-and-braces - the real
+    # guarantee is the pre-created local account in autounattend-nano.xml.
     Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\OOBE' 'BypassNRO' 'REG_DWORD' '1'
+    Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\OOBE' 'DisableOnline' 'REG_DWORD' '1'
 
-    # Copy autounattend-nano.xml as autounattend.xml
-    $nanoAutoUnattend = Join-Path (Split-Path $PSScriptRoot -Parent) "autounattend-nano.xml"
-    if (Test-Path $nanoAutoUnattend) {
-        Copy-Item -Path $nanoAutoUnattend -Destination "$scratchDir\Windows\System32\Sysprep\autounattend.xml" -Force
-        Write-Log "Copied autounattend-nano.xml to Sysprep"
-    }
+    # Bake the answer file into the image too, so a later sysprep /generalize keeps
+    # the same OOBE behaviour.
+    Write-IsoAnswerFile -Destination "$scratchDir\Windows\System32\Sysprep\autounattend.xml"
 
     # Disable reserved storage
     Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\ReserveManager' 'ShippedWithReserves' 'REG_DWORD' '0'
@@ -1069,8 +1128,11 @@ function Apply-RegistryTweaks {
     # intentionally absent. (Companion to the Remove-WinRE build-time deletion.)
     Set-RegistryValue 'HKLM\zSYSTEM\ControlSet001\Control\WinRE' 'WinREEnabled' 'REG_DWORD' '0'
 
-    # Hide settings pages
-    Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer' 'SettingsPageVisibility' 'REG_SZ' 'hide:virus;windowsupdate'
+    # Hide both Settings pages. Page ids are the ms-settings URI minus the
+    # 'ms-settings:' prefix, so the Windows Security page is 'windowsdefender'.
+    # This value used to read 'hide:virus;windowsupdate' - 'virus' is not a
+    # Windows 11 page id, so it hid nothing.
+    Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer' 'SettingsPageVisibility' 'REG_SZ' 'hide:windowsupdate;windowsdefender'
 
     # Easter Egg / Branding
     Write-Log "Adding Easter Egg branding..."
@@ -1150,9 +1212,11 @@ function Apply-PerformanceTweaks {
     Set-RegistryValue 'HKLM\zSYSTEM\ControlSet001\Control\Session Manager\Power' 'HiberbootEnabled' 'REG_DWORD' '0'
     # Keep crash dump on BSOD — preserves minidump for analysis instead of silent restart
     Set-RegistryValue 'HKLM\zSYSTEM\ControlSet001\Control\CrashControl' 'AutoReboot' 'REG_DWORD' '0'
-    # BCD: short boot menu + disable dynamic tick for lower timer interrupt latency (gaming)
+    # BCD: short boot menu + keep the system timer from going tickless while idle.
+    # 'useplatformtick yes' is deliberately NOT set: it forces the platform timer
+    # (HPET-class) as the tick source, which is slower than the invariant TSC.
     Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce' 'PerfTuneBCD' 'REG_SZ' `
-        'powershell -WindowStyle Hidden -ExecutionPolicy Bypass -Command "& bcdedit /set timeout 5 2>&1 | Out-Null; & bcdedit /set disabledynamictick yes 2>&1 | Out-Null; & bcdedit /set useplatformtick yes 2>&1 | Out-Null"'
+        'powershell -WindowStyle Hidden -ExecutionPolicy Bypass -Command "& bcdedit /set timeout 5 2>&1 | Out-Null; & bcdedit /set disabledynamictick yes 2>&1 | Out-Null; & bcdedit /deletevalue useplatformtick 2>&1 | Out-Null"'
 
     Write-Log "Performance optimizations applied (gaming/VM profile)"
 }
@@ -1229,6 +1293,14 @@ function Dismount-AndExport {
     Write-Log "Exporting image with maximum compression..."
     $tempWim = "$nano11Dir\sources\install2.wim"
     & Dism.exe /English /Export-Image /SourceImageFile:$wimFilePath /SourceIndex:$INDEX /DestinationImageFile:$tempWim /Compress:max
+
+    # Never delete the source image if the export above failed. A failed export that
+    # still deletes install.wim leaves the ISO with no install image at all, and
+    # Windows Setup reports that as "A media driver your computer needs is missing"
+    # - which looks like a USB or driver fault and hides the real cause.
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $tempWim)) {
+        throw "DISM /Export-Image failed (exit code $LASTEXITCODE). Refusing to delete $wimFilePath."
+    }
 
     Remove-Item -Path $wimFilePath -Force
     Rename-Item -Path $tempWim -NewName "install.wim"
@@ -1311,6 +1383,12 @@ function Convert-ToESD {
     Write-Log "Converting to ESD format for maximum compression..."
     $esdPath = "$nano11Dir\sources\install.esd"
     & dism /Export-Image /SourceImageFile:$wimFilePath /SourceIndex:1 /DestinationImageFile:$esdPath /Compress:recovery
+    # Same guard as Dismount-AndExport: never delete the source WIM unless the ESD
+    # export actually succeeded.
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $esdPath)) {
+        throw "DISM /Export-Image to install.esd failed (exit code $LASTEXITCODE). Refusing to delete $wimFilePath."
+    }
+
     Remove-Item $wimFilePath -Force -ErrorAction SilentlyContinue
     Write-Log "ESD conversion complete"
 }
@@ -1330,11 +1408,36 @@ function Clean-IsoRoot {
 function Create-NanoISO {
     Write-Log "Creating ISO image..."
 
-    # Copy autounattend-nano.xml as autounattend.xml to ISO root
-    $nanoAutoUnattend = Join-Path (Split-Path $PSScriptRoot -Parent) "autounattend-nano.xml"
-    if (Test-Path $nanoAutoUnattend) {
-        Copy-Item -Path $nanoAutoUnattend -Destination "$nano11Dir\autounattend.xml" -Force
-        Write-Log "Copied autounattend-nano.xml to ISO root as autounattend.xml"
+    # The answer file at the ISO root is the one Windows Setup auto-detects when
+    # booting the media. Write-IsoAnswerFile also pins the edition index into it.
+    Write-IsoAnswerFile -Destination "$nano11Dir\autounattend.xml"
+
+    # Guard: an ISO with no usable install image produces exactly the symptom
+    # "A media driver your computer needs is missing" when Setup looks for its media,
+    # which is easy to misread as a USB or driver fault. Fail the build here rather
+    # than shipping it.
+    $installImages = @("$nano11Dir\sources\install.wim", "$nano11Dir\sources\install.esd") |
+        Where-Object { Test-Path $_ }
+
+    if (-not $installImages) {
+        throw "No install.wim or install.esd in $nano11Dir\sources - the image export step failed. Refusing to build an ISO that Setup cannot install from."
+    }
+
+    foreach ($img in $installImages) {
+        $imgMB = [math]::Round((Get-Item $img).Length / 1MB, 1)
+        Write-Log "Install image $([System.IO.Path]::GetFileName($img)): ${imgMB}MB"
+        if ($imgMB -lt 500) {
+            throw "Install image $img is only ${imgMB}MB - it looks truncated. Refusing to build the ISO."
+        }
+    }
+
+    # A leftover export would confuse Setup's media detection.
+    foreach ($stray in @('install2.wim', 'install2.esd')) {
+        $strayPath = Join-Path "$nano11Dir\sources" $stray
+        if (Test-Path $strayPath) {
+            Write-Log "Removing leftover $stray from sources\" "WARN"
+            Remove-Item -Path $strayPath -Force -ErrorAction SilentlyContinue
+        }
     }
 
     # Verify boot files
@@ -1365,8 +1468,16 @@ function Create-NanoISO {
         $OSCDIMG = $localOSCDIMGPath
     }
 
+    # ---- ISO container --------------------------------------------------------
+    # -u2        ISO9660 + Joliet + UDF, the layout Microsoft's own retail media
+    #            uses. ISO9660 alone cannot hold a >4 GB file, so the UDF layer is
+    #            what carries install.wim / install.esd.
+    # -udfver150 UDF 1.50 rather than 1.02. UDF 1.02 cannot describe a single file
+    #            larger than 4 GB. This is a robustness fix only - it is NOT what
+    #            made Ventoy fail. See "Booting a Tiny11 ISO from Ventoy" in
+    #            README.md for that.
     Write-Log "Building bootable ISO..."
-    & $OSCDIMG '-m' '-o' '-u2' '-udfver102' `
+    & $OSCDIMG '-m' '-o' '-u2' '-udfver150' `
         "-bootdata:2#p0,e,b$nano11Dir\boot\etfsboot.com#pEF,e,b$nano11Dir\efi\microsoft\boot\efisys.bin" `
         $nano11Dir $outputISO
 

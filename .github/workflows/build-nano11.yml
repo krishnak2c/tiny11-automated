@@ -9,13 +9,13 @@ on:
   workflow_dispatch:
     inputs:
       windows_version:
-        description: 'Windows version (e.g., 24H2, 25H2)'
+        description: 'Windows version (e.g., 24H2, 25H2, 26H2)'
         required: false
-        default: '25H2'
+        default: '26H2'
       windows_iso_url:
         description: 'Windows 11 ISO download URL'
         required: true
-        default: 'https://software.download.prss.microsoft.com/dbazure/Win11_25H2_English_x64.iso?t=641a9719-5089-48d3-b683-44d9012b040e&P1=1765893811&P2=601&P3=2&P4=kPgTlzFR6%2bt9lzW6l2ITzVyc3%2fMHiCzaC5YMwf3RcQH%2bXezCHitvttx2e91%2fT%2bPcXPxVLKAYbeqrAW2mZozm1q%2bTjC4JYdInC0gROdmtKH2X84U99HD1RzRhTXmFi7lemqPDAHcOZ4yx95AzW6rzMvQF2QBsmSE%2fl5l8bWupChqEd28LHdjMXrSu3otYpyxc8S4cFluEgaLD2mkPCrqX61ij2PUrqiZM2jq%2bbz5Fx3kNXCZ3Z1pJkfKKQGb3T%2fvbbWfu7avjuU2kBDJjyeecJH3MGeTP9jsbT6oIHU95AL05%2bA43il%2f4rGDNcFGji1logGrKYi%2f%2b2fDpCFuGh9rN5w%3d%3d'
+        default: 'https://software.download.prss.microsoft.com/dbazure/Windows11_Client_x64_en-us_26300_9457.iso?t=80c8fc30-ff56-4c95-8024-adc31f3918cb&P1=1791748912&P2=602&P3=2&P4=iVKrQtUXouUQIrGM81OYIB8hRan2qtmXe2qAIEU3Yt4EcqV0aHWqRtPrWr3q%2bwB2mhxz9795hHc%2bNp1MsjJjJU9mIL5SZPD13Aw1ZxH5O6oANHYS84G3k%2f0JZbPiBIe5%2bG8CpdpAJhq6n5yzYgajyGkmgvmVYmidHOPO3BehAgfu3hwqFk9uozIrikhCkr2Rk6u6yT4%2f1Al4V5duQjJUDqT2irslL%2fRe5qh1wRH%2bADoHxUsN%2fIJt6yzx%2fRa5%2fx9n7nJTIjOj7Dlg1Zdf1oc%2bES4JSzrur6TRuGjTZAVSKSyobiBJAe3s6FkhW7boGWvUzdyHF2qc%2fBNhjuJPh9HB0g%3d%3d'
       windows_build:
         description: 'Fallback Windows build number (e.g. 26200.8655) — only used if it cannot be read directly from the ISO'
         required: false
